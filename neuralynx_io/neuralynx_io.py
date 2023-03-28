@@ -1,11 +1,9 @@
-# coding=utf-8
-
 from __future__ import division
-
 import os
 import warnings
+import mmap
 import numpy as np
-import datetime
+import ntpath
 
 HEADER_LENGTH = 16 * 1024  # 16 kilobytes of header
 
@@ -46,6 +44,15 @@ MILLIVOLT_SCALING = (1000, u'mV')
 MICROVOLT_SCALING = (1000000, u'µV')
 
 
+logging_on = False
+
+
+def log(msg):
+    global logging_on
+    if logging_on:
+        print(msg)
+
+
 def read_header(fid):
     # Read the raw header data (16 kb) from the file object fid. Restores the position in the file object after reading.
     pos = fid.tell()
@@ -69,6 +76,7 @@ def parse_header(raw_hdr):
     if hdr_lines[0] != '######## Neuralynx Data File Header':
         warnings.warn('Unexpected start to header: ' + hdr_lines[0])
 
+    """
     # Try to read the original file path
     try:
         assert hdr_lines[1].split()[1:3] == ['File', 'Name']
@@ -82,28 +90,70 @@ def parse_header(raw_hdr):
     hdr[u'TimeOpened_dt'] = parse_neuralynx_time_string(hdr_lines[2])
     hdr[u'TimeClosed'] = hdr_lines[3][3:]
     hdr[u'TimeClosed_dt'] = parse_neuralynx_time_string(hdr_lines[3])
+    """
 
     # Read the parameters, assuming "-PARAM_NAME PARAM_VALUE" format
-    for line in hdr_lines[4:]:
+    #for line in hdr_lines[4:]:
+    for line in hdr_lines[1:]:
         try:
-            name, value = line[1:].split()  # Ignore the dash and split PARAM_NAME and PARAM_VALUE
+            name, value = line[1:].split(' ', 1)  # Ignore the dash and split PARAM_NAME and PARAM_VALUE
             hdr[name] = value
-        except:
+        except Exception as e:
             warnings.warn('Unable to parse parameter line from Neuralynx header: ' + line)
 
     return hdr
 
 
-def read_records(fid, record_dtype, record_skip=0, count=None):
-    # Read count records (default all) from the file object fid skipping the first record_skip records. Restores the
-    # position of the file object after reading.
-    if count is None:
-        count = -1
+"""
+def read_records_with_numpy_memmap(fid, record_dtype, record_skip=0):
+    rec_count = 0
+    while True:
+        rec_chunk = fid.read(record_dtype.itemsize)
+        if not rec_chunk:
+            break
+        rec_count += 1
 
+    # filename = path.join(mkdtemp(), 'memmap_test.dat')
+    filename = 'memmap_test.dat'
+    fp = np.memmap(filename, dtype=record_dtype, mode='w+', shape=(rec_count))
+
+    fid.seek(HEADER_LENGTH, 0)
+    fid.seek(record_skip * record_dtype.itemsize, 1)
+
+    chunk_size = 32768  # 2^15 - number of records to read at once
+    for i in range(0, rec_count, chunk_size):
+        rec_chunk = fid.read(record_dtype.itemsize * chunk_size)
+        record = np.frombuffer(rec_chunk, dtype=record_dtype)
+        fp[i:i + chunk_size] = record
+        fp.flush()
+
+    return fp
+"""
+
+
+def read_records(fid, record_dtype, record_skip=0, memmap=True, count=None, record_count=None):
     pos = fid.tell()
     fid.seek(HEADER_LENGTH, 0)
     fid.seek(record_skip * record_dtype.itemsize, 1)
-    rec = np.fromfile(fid, record_dtype, count=count)
+
+    if memmap:
+        """
+        record_count = 0
+        while True:
+            rec_chunk = fid.read(record_dtype.itemsize)
+            if not rec_chunk:
+                break
+            record_count += 1
+        """
+        # Source: https://stackoverflow.com/questions/60493766/read-binary-flatfile-and-skip-bytes
+        mm = mmap.mmap(fid.fileno(), length=0, access=mmap.ACCESS_READ)
+        rec = np.ndarray(buffer=mm, dtype=record_dtype, offset=HEADER_LENGTH, shape=record_count)
+        #rec = np.ndarray(buffer=mm, dtype=record_dtype, offset=HEADER_LENGTH, shape=record_count).copy()
+        # mm.close()  # TODO needed?
+    else:
+        count = -1 if count is None else count
+        rec = np.fromfile(fid, record_dtype, count=count)  # Original read
+
     fid.seek(pos)
 
     return rec
@@ -116,29 +166,17 @@ def estimate_record_count(file_path, record_dtype):
 
     if file_size % record_dtype.itemsize != 0:
         warnings.warn('File size is not divisible by record size (some bytes unaccounted for)')
+        raise Exception('File size is not divisible by record size (some bytes unaccounted for)')
 
-    return file_size / record_dtype.itemsize
-
-
-def parse_neuralynx_time_string(time_string):
-    # Parse a datetime object from the idiosyncratic time string in Neuralynx file headers
-    try:
-        tmp_date = [int(x) for x in time_string.split()[4].split('/')]
-        tmp_time = [int(x) for x in time_string.split()[-1].replace('.', ':').split(':')]
-        tmp_microsecond = tmp_time[3] * 1000
-    except:
-        warnings.warn('Unable to parse time string from Neuralynx header: ' + time_string)
-        return None
-    else:
-        return datetime.datetime(tmp_date[2], tmp_date[0], tmp_date[1],  # Year, month, day
-                                 tmp_time[0], tmp_time[1], tmp_time[2],  # Hour, minute, second
-                                 tmp_microsecond)
+    return int(file_size / record_dtype.itemsize)
 
 
 def check_ncs_records(records):
-    # Check that all the records in the array are "similar" (have the same sampling frequency etc.
+    # Check that all the records in the array are "similar" (have the same sampling frequency etc.)
     dt = np.diff(records['TimeStamp'])
+    dt = dt.astype('int64')
     dt = np.abs(dt - dt[0])
+
     if not np.all(records['ChannelNumber'] == records[0]['ChannelNumber']):
         warnings.warn('Channel number changed during record sequence')
         return False
@@ -155,20 +193,29 @@ def check_ncs_records(records):
         return True
 
 
-def load_ncs(file_path, load_time=True, rescale_data=True, signal_scaling=MICROVOLT_SCALING):
-    # Load the given file as a Neuralynx .ncs continuous acquisition file and extract the contents
+def load_ncs(file_path, rescale_data=False, signal_scaling=MICROVOLT_SCALING, verbose=False):
+    global logging_on
+    logging_on = verbose
+
+    log('Loading NCS...')
     file_path = os.path.abspath(file_path)
+    record_count = estimate_record_count(file_path, NCS_RECORD)
+
     with open(file_path, 'rb') as fid:
+        log('Reading header')
         raw_header = read_header(fid)
-        records = read_records(fid, NCS_RECORD)
+        log('Reading records')
+        records = read_records(fid, NCS_RECORD, record_count=record_count)
+        fid.close()
 
     header = parse_header(raw_header)
     check_ncs_records(records)
 
     # Reshape (and rescale, if requested) the data into a 1D array
     data = records['Samples'].ravel()
-    #data = records['Samples'].reshape((NCS_SAMPLES_PER_RECORD * len(records), 1))
+
     if rescale_data:
+        log('Rescaling data')
         try:
             # ADBitVolts specifies the conversion factor between the ADC counts and volts
             data = data.astype(np.float64) * (np.float64(header['ADBitVolts']) * signal_scaling[0])
@@ -176,9 +223,9 @@ def load_ncs(file_path, load_time=True, rescale_data=True, signal_scaling=MICROV
             warnings.warn('Unable to rescale data, no ADBitVolts value specified in header')
             rescale_data = False
 
-    # Pack the extracted data in a dictionary that is passed out of the function
     ncs = dict()
     ncs['file_path'] = file_path
+    ncs['file_name'] = ntpath.basename(file_path)
     ncs['raw_header'] = raw_header
     ncs['header'] = header
     ncs['data'] = data
@@ -186,31 +233,22 @@ def load_ncs(file_path, load_time=True, rescale_data=True, signal_scaling=MICROV
     ncs['sampling_rate'] = records['SampleFreq'][0]
     ncs['channel_number'] = records['ChannelNumber'][0]
     ncs['timestamp'] = records['TimeStamp']
+    ncs['scaling_factor'] = signal_scaling[0]
 
-    # Calculate the sample time points (if needed)
-    if load_time:
-        num_samples = data.shape[0]
-        times = np.interp(np.arange(num_samples), np.arange(0, num_samples, 512), records['TimeStamp']).astype(np.uint64)
-        ncs['time'] = times
-        ncs['time_units'] = u'µs'
+    log('Loading NCS finished')
 
     return ncs
 
 
 def load_nev(file_path):
-    # Load the given file as a Neuralynx .nev event file and extract the contents
     file_path = os.path.abspath(file_path)
+
     with open(file_path, 'rb') as fid:
         raw_header = read_header(fid)
-        records = read_records(fid, NEV_RECORD)
+        records = read_records(fid, NEV_RECORD, memmap=False)
 
     header = parse_header(raw_header)
 
-    # Check for the packet data size, which should be two. DISABLED because these seem to be set to 0 in our files.
-    #assert np.all(record['pkt_data_size'] == 2), 'Some packets have invalid data size'
-
-
-    # Pack the extracted data in a dictionary that is passed out of the function
     nev = dict()
     nev['file_path'] = file_path
     nev['raw_header'] = raw_header
